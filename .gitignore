@@ -1,0 +1,12 @@
+*.db
+.env
+assets/
+samples/
+node_modules/
+instrukcja.md
+.http
+testy.ts
+aws
+http
+awscliv2.zip
+tubely.db
