@@ -51,13 +51,17 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   try {
     await Bun.write(tempFilePath, videoFile);
 
-    const s3File = cfg.s3Client.file(fileName);
+    const aspectRatio = await getVideoAspectRatio(tempFilePath);
+
+    const s3Key = `${aspectRatio}/${fileName}`;
+
+    const s3File = cfg.s3Client.file(s3Key);
 
     await s3File.write(Bun.file(tempFilePath), {
       type: videoFile.type,
     });
 
-    const videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${fileName}`;
+    const videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${s3Key}`;
     video.videoURL = videoURL;
     updateVideo(cfg.db, video);
 
@@ -69,4 +73,49 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
       console.error(`Failed to remove temp file ${tempFilePath}:`, e);
     }
   }
+}
+
+export async function getVideoAspectRatio(filePath: string): Promise<string> {
+  const proc = Bun.spawn([
+    "ffprobe",
+    "-v", "error",
+    "-select_streams", "v:0",
+    "-show_entries", "stream=width,height",
+    "-of", "json",
+    filePath
+  ]);
+
+  const stdouText = await new Response(proc.stdout).text();
+  const stderrText = await new Response(proc.stderr).text();
+
+  const exitCode = await proc.exited;
+
+
+  if(exitCode !== 0){
+    throw new Error(`ffprobe xd failed with exit code ${exitCode}`);
+  }
+
+  const data = JSON.parse(stdouText);
+
+  const stream = data.streams?.[0];
+
+  if(!stream || !stream.width || !stream.height){
+    return "other";
+  }
+
+  const width = stream.width;
+  const height = stream.height;
+  const ratio = width/height; 
+
+  const is16_9 = Math.abs(ratio - 16/9) < 0.1;
+  const is9_16 = Math.abs(ratio - 9/16) < 0.1;
+
+  //console.log(is16_9);
+  //console.log(is9_16);
+
+  if(is16_9) return "landscape";
+  if(is9_16) return "portrait";
+
+  return "other";
+
 }
