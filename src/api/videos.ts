@@ -3,9 +3,11 @@ import { BadRequestError, NotFoundError, UserForbiddenError } from "./errors";
 import { type ApiConfig } from "../config";
 import type { BunRequest } from "bun";
 import { getBearerToken, validateJWT } from "../auth";
-import { getVideo, updateVideo } from "../db/videos";
+import { type Video, getVideo, updateVideo } from "../db/videos";
 import { randomBytes } from "crypto";
 import { unlink } from "node:fs/promises";
+import { s3 } from "bun";
+
 
 export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   const { videoId } = req.params as { videoId?: string };
@@ -51,17 +53,20 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
   try {
     await Bun.write(tempFilePath, videoFile);
 
+    const processedFilePath = await processVideoForFastStart(tempFilePath);
+
     const aspectRatio = await getVideoAspectRatio(tempFilePath);
 
     const s3Key = `${aspectRatio}/${fileName}`;
 
     const s3File = cfg.s3Client.file(s3Key);
 
-    await s3File.write(Bun.file(tempFilePath), {
+    await s3File.write(Bun.file(processedFilePath), {
       type: videoFile.type,
     });
 
-    const videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${s3Key}`;
+    const videoURL = `${cfg.s3CfDistribution}/${s3Key}`;
+    //const videoURL = `https://${cfg.s3Bucket}.s3.${cfg.s3Region}.amazonaws.com/${s3Key}`;
     video.videoURL = videoURL;
     updateVideo(cfg.db, video);
 
@@ -71,6 +76,14 @@ export async function handlerUploadVideo(cfg: ApiConfig, req: BunRequest) {
       await unlink(tempFilePath);
     } catch (e) {
       console.error(`Failed to remove temp file ${tempFilePath}:`, e);
+    }
+    try {
+      const processedFilePath = `${tempFilePath}.processed`;
+      await unlink(processedFilePath);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.error(`Failed to remove processed file:`, e);
+      }
     }
   }
 }
@@ -91,7 +104,7 @@ export async function getVideoAspectRatio(filePath: string): Promise<string> {
   const exitCode = await proc.exited;
 
 
-  if(exitCode !== 0){
+  if (exitCode !== 0) {
     throw new Error(`ffprobe xd failed with exit code ${exitCode}`);
   }
 
@@ -99,23 +112,45 @@ export async function getVideoAspectRatio(filePath: string): Promise<string> {
 
   const stream = data.streams?.[0];
 
-  if(!stream || !stream.width || !stream.height){
+  if (!stream || !stream.width || !stream.height) {
     return "other";
   }
 
   const width = stream.width;
   const height = stream.height;
-  const ratio = width/height; 
+  const ratio = width / height;
 
-  const is16_9 = Math.abs(ratio - 16/9) < 0.1;
-  const is9_16 = Math.abs(ratio - 9/16) < 0.1;
+  const is16_9 = Math.abs(ratio - 16 / 9) < 0.1;
+  const is9_16 = Math.abs(ratio - 9 / 16) < 0.1;
 
-  //console.log(is16_9);
-  //console.log(is9_16);
 
-  if(is16_9) return "landscape";
-  if(is9_16) return "portrait";
+  if (is16_9) return "landscape";
+  if (is9_16) return "portrait";
 
   return "other";
-
 }
+
+export async function processVideoForFastStart(inputFilePath: string): Promise<string> {
+  const outputFilePath = `${inputFilePath}.processed`;
+
+  const proc = Bun.spawn([
+    "ffmpeg",
+    "-i", inputFilePath,
+    "-movflags", "faststart",
+    "-map_metadata", "0",
+    "-codec", "copy",
+    "-f", "mp4",
+    outputFilePath
+  ]);
+
+  const stderrText = await new Response(proc.stderr).text();
+  const exitCode = await proc.exited;
+
+  if (exitCode !== 0) {
+    throw new Error(`ffmpeg failed to process video: ${stderrText}`);
+  }
+
+
+  return outputFilePath;
+}
+
